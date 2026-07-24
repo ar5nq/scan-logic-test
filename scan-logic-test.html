@@ -89,6 +89,21 @@
     <iframe src="https://feed.financialjuice.com/widgets/headlines.aspx?wtype=NEWS&mode=Dark&container=fj-test&width=100%25&height=480&backC=0f1215&fontC=d8dde3&affurl="
       style="width:100%;height:480px;border:1px solid var(--border);" title="FinancialJuice live headlines"></iframe>
   </section>
+  <section>
+    <h2>4 \u00b7 Backtest (real win-rate numbers, runs right here \u2014 no Node needed)</h2>
+    <div class="footnote" style="border:1px solid var(--border);padding:10px 12px;background:#0d0f11;margin-bottom:10px;">
+      Walk-forward test: replays ~2 years of hourly bars per instrument, and at every step only lets the scorer see data up to that point (no peeking at the future \u2014 that's the only honest way to backtest). Whenever it would've printed STRONG, it checks 4h/8h/24h later whether price actually moved the predicted direction. This takes a few minutes and does real work \u2014 the tab stays responsive but don't close it mid-run.
+    </div>
+    <button id="run-backtest-btn">RUN BACKTEST (all 15, ~2\u20135 min)</button>
+    <div class="status" id="backtest-status"></div>
+    <table id="backtest-table" style="display:none;">
+      <thead><tr><th>Instrument</th><th>STRONG calls</th><th>4h win%</th><th>8h win%</th><th>24h win%</th></tr></thead>
+      <tbody id="backtest-tbody"></tbody>
+    </table>
+    <div class="footnote" id="backtest-caveat" style="display:none;margin-top:10px;">
+      "Win" = price moved the predicted direction by that horizon \u2014 this is a directional-accuracy check, not a P&L backtest (no stop/target/spread/slippage modeled). Instruments with under ~15\u201320 STRONG calls don't have a reliable sample yet; don't market a number built on a handful of calls.
+    </div>
+  </section>
 
 </main>
 
@@ -521,6 +536,114 @@ async function runCalendarCheck(){
   btn.disabled = false;
 }
 document.getElementById('run-cal-btn').onclick = runCalendarCheck;
+
+/* ================= backtest (browser, no Node) ================= */
+const BT_HISTORY_RANGE = '2y';
+const BT_HORIZONS = [4, 8, 24];
+const BT_STEP_BARS = 4;
+const BT_WINDOW_BARS = 400;
+
+async function fetchYahooHistory(yTickers){
+  let lastErr;
+  for(const yTicker of yTickers){
+    try{
+      const bars1 = await fetchYahooBars(yTicker, '60m', BT_HISTORY_RANGE);
+      if(bars1.length < BT_WINDOW_BARS + 100) throw new Error(`only ${bars1.length} bars`);
+      return { bars1, usedTicker: yTicker };
+    }catch(err){ lastErr = err; }
+  }
+  throw lastErr;
+}
+
+function runWalkForward(instId, ownBars1, partnerBars1){
+  const calls = [];
+  const start = BT_WINDOW_BARS;
+  const end = ownBars1.length - Math.max(...BT_HORIZONS) - 1;
+  for(let i=start; i<end; i+=BT_STEP_BARS){
+    const windowBars1 = ownBars1.slice(i-BT_WINDOW_BARS, i+1);
+    const windowBars4 = aggregateCandles(windowBars1, 4);
+    const price = windowBars1[windowBars1.length-1].c;
+    let pw1=null, pw4=null;
+    if(partnerBars1){
+      const pIdx = Math.min(i, partnerBars1.length-1);
+      pw1 = partnerBars1.slice(Math.max(0,pIdx-BT_WINDOW_BARS), pIdx+1);
+      pw4 = aggregateCandles(pw1, 4);
+    }
+    const bundle = computeScan({ id: instId, price }, windowBars4, windowBars1, pw1, pw4);
+    const result = bundle.result;
+    if(result.label !== 'STRONG') continue;
+    const outcome = {};
+    for(const h of BT_HORIZONS){
+      const fb = ownBars1[i+h];
+      if(!fb) continue;
+      const moved = fb.c - price;
+      outcome[h] = result.bias==='BULLISH' ? moved>0 : moved<0;
+    }
+    calls.push({ t: ownBars1[i].t, bias: result.bias, outcome });
+  }
+  return calls;
+}
+
+function summarizeBT(instId, calls){
+  const row = { instId, total: calls.length };
+  for(const h of BT_HORIZONS){
+    const withOutcome = calls.filter(c=> c.outcome[h]!=null);
+    const wins = withOutcome.filter(c=> c.outcome[h]).length;
+    row[`h${h}`] = withOutcome.length ? `${(100*wins/withOutcome.length).toFixed(1)}% (${withOutcome.length})` : '\u2014';
+  }
+  return row;
+}
+
+const yieldToUI = ()=> new Promise(r=> setTimeout(r, 0));
+
+async function runBacktest(){
+  const btn = document.getElementById('run-backtest-btn');
+  btn.disabled = true;
+  const statusEl = document.getElementById('backtest-status');
+  const table = document.getElementById('backtest-table'), tbody = document.getElementById('backtest-tbody');
+  const caveat = document.getElementById('backtest-caveat');
+  tbody.innerHTML = ''; table.style.display = 'table'; caveat.style.display = 'block';
+  clearLog('Starting backtest \u2014 fetching ~2 years of hourly data per instrument, this takes a while...');
+
+  const historyCache = {};
+  async function getHistory(id){
+    if(!historyCache[id]){
+      statusEl.textContent = `Fetching history for ${id}...`;
+      await yieldToUI();
+      historyCache[id] = await fetchYahooHistory(INSTRUMENTS[id].yTickers);
+      log(`fetched ${historyCache[id].bars1.length} hourly bars for ${id} via ${historyCache[id].usedTicker}`);
+    }
+    return historyCache[id];
+  }
+
+  for(const id of WATCHLIST){
+    try{
+      const own = await getHistory(id);
+      let partner = null;
+      const partnerId = SMT_PARTNER[id];
+      if(partnerId){ try{ partner = await getHistory(partnerId); }catch(e){ log(`partner fetch failed for ${partnerId}: ${e.message} (SMT skipped for ${id})`); } }
+
+      statusEl.textContent = `Walk-forward testing ${id}...`;
+      await yieldToUI();
+      const calls = runWalkForward(id, own.bars1, partner?.bars1);
+      const row = summarizeBT(id, calls);
+
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td><b>${id}</b></td><td>${row.total}</td><td>${row.h4}</td><td>${row.h8}</td><td>${row.h24}</td>`;
+      tbody.appendChild(tr);
+      log(`${id}: ${row.total} STRONG calls \u2014 4h ${row.h4}, 8h ${row.h8}, 24h ${row.h24}`);
+    }catch(err){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${id}</td><td colspan="4" style="color:var(--red)">FAILED: ${err.message}</td>`;
+      tbody.appendChild(tr);
+      log(`${id} FAILED: ${err.message}`);
+    }
+    await yieldToUI();
+  }
+  statusEl.textContent = 'Backtest complete. Read the caveat below before using these numbers anywhere.';
+  btn.disabled = false;
+}
+document.getElementById('run-backtest-btn').onclick = runBacktest;
 </script>
 </body>
 </html>
