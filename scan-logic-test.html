@@ -81,6 +81,14 @@
   <div class="footnote">
     This page fetches directly from query1.finance.yahoo.com and nfs.faireconomy.media (Forex Factory's own published weekly export) — same as the terminal and scan.js do. If a request fails, it's most likely a transient CORS/rate-limit hiccup from one of those hosts, not a bug in the scoring logic itself; re-run and check the log above for the actual error.
   </div>
+  <section>
+    <h2>3 · Live headlines (FinancialJuice \u2014 instant, while this tab is open)</h2>
+    <div class="footnote" style="border:1px solid var(--border);padding:10px 12px;background:#0d0f11;margin-bottom:10px;">
+      This is FinancialJuice's own free public widget \u2014 genuinely real-time, it's the same feed prop-trading desks use as a squawk box. Two honest limits: (1) it only updates while this tab is actually open, it doesn't push to your phone by itself; (2) FinancialJuice has no public API for scan.js to poll and push through, so this can't be wired into the GitHub Actions phone-alert pipeline \u2014 only this in-browser widget. If you want real phone-push instant headlines (not just calendar releases), their own free app already does that natively.
+    </div>
+    <iframe src="https://feed.financialjuice.com/widgets/headlines.aspx?wtype=NEWS&mode=Dark&container=fj-test&width=100%25&height=480&backC=0f1215&fontC=d8dde3&affurl="
+      style="width:100%;height:480px;border:1px solid var(--border);" title="FinancialJuice live headlines"></iframe>
+  </section>
 
 </main>
 
