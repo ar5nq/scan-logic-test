@@ -62,10 +62,15 @@
   </section>
 
   <section>
-    <h2>2 · Econ calendar (high-impact, relevant currencies only)</h2>
+    <h2>2 · Econ calendar (pick a ticker \u2014 shows news that actually moves it)</h2>
+    <select id="cal-inst-select" style="background:#000;border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:8px;margin-right:8px;"></select>
     <button id="run-cal-btn">RUN CALENDAR CHECK</button>
     <div class="status" id="cal-status"></div>
-    <div id="cal-results"></div>
+    <div class="footnote" style="margin-top:10px;border:1px solid var(--border);padding:10px 12px;background:#0d0f11;">
+      <b style="color:var(--text);">Folder colors, same as FF itself:</b> <b style="color:var(--red);">RED</b> = high impact, <b style="color:#ff9a3c;">ORANGE</b> = medium, <b style="color:#e0c200;">YELLOW</b> = low (shown but shouldn't move the market much \u2014 included for visibility, not because it needs your attention).<br><br>
+      <b style="color:var(--amber);">Note on prop firms:</b> most prop firm news-trading rules target <b style="color:var(--red);">RED</b> (high-impact) events specifically, and yellow/low-impact generally isn't restricted anywhere. But a number of firms also restrict <b style="color:#ff9a3c;">ORANGE</b> (medium-impact) \u2014 rules vary firm to firm, so if you're on a funded/eval account, check your specific firm's news-trading policy rather than assuming based on folder color alone.
+    </div>
+    <div id="cal-results" style="margin-top:14px;"></div>
   </section>
 
   <section>
@@ -109,11 +114,24 @@ const SMT_PARTNER = {
   US30:'SP500',
 };
 const CALENDAR_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
+// Which currencies actually move each instrument — used to scope the news
+// panel to just the ticker the user picked, not everything at once.
+const CURRENCIES_FOR = {
+  EURUSD: ['EUR','USD'], GBPUSD: ['GBP','USD'],
+  XAUUSD: ['USD'], XAGUSD: ['USD'],
+  NAS100: ['USD'], SP500: ['USD'], US30: ['USD'],
+  AUDUSD: ['AUD','USD'], NZDUSD: ['NZD','USD'],
+  USDJPY: ['USD','JPY'], USDCAD: ['USD','CAD'],
+  EURGBP: ['EUR','GBP'], EURJPY: ['EUR','JPY'],
+  GER40: ['EUR'], UK100: ['GBP'],
+};
 const RELEVANT_CURRENCIES = new Set(['USD']);
 Object.keys(INSTRUMENTS).forEach(id=>{
   if(/^[A-Z]{6}$/.test(id)){ RELEVANT_CURRENCIES.add(id.slice(0,3)); RELEVANT_CURRENCIES.add(id.slice(3,6)); }
 });
 const ALERT_WINDOW_MIN = 45;
+// FF's impact field maps straight to the folder colors traders already know.
+const FOLDER = { high:{label:'RED', color:'var(--red)'}, medium:{label:'ORANGE', color:'#ff9a3c'}, low:{label:'YELLOW', color:'#e0c200'} };
 
 /* ================= core scan logic (verbatim from scan.js) ================= */
 function aggregateCandles(bars, factor){
@@ -378,6 +396,9 @@ function clearLog(msg){ logEl.textContent = msg; }
 const selectEl = document.getElementById('inst-select');
 WATCHLIST.forEach(id=>{ const o=document.createElement('option'); o.value=id; o.textContent=id; selectEl.appendChild(o); });
 
+const calSelectEl = document.getElementById('cal-inst-select');
+WATCHLIST.forEach(id=>{ const o=document.createElement('option'); o.value=id; o.textContent=id; calSelectEl.appendChild(o); });
+
 async function scanOne(id, cache){
   const inst = INSTRUMENTS[id];
   if(!cache[id]){
@@ -443,37 +464,51 @@ async function runCalendarCheck(){
   const statusEl = document.getElementById('cal-status');
   const resultsEl = document.getElementById('cal-results');
   resultsEl.innerHTML = '';
-  clearLog('Fetching econ calendar...');
+  const instId = calSelectEl.value;
+  const currencies = new Set(CURRENCIES_FOR[instId] || []);
+  clearLog(`Fetching econ calendar for ${instId} (currencies: ${[...currencies].join(', ')})...`);
   statusEl.textContent = 'Fetching...';
   try{
     const res = await fetchWithCorsFallback(CALENDAR_URL);
     const events = await res.json();
     log(`fetched ${events.length} events for this week`);
     const now = Date.now();
-    const highImpactRelevant = events.filter(ev => (ev.impact||'').toLowerCase()==='high' && RELEVANT_CURRENCIES.has(ev.country));
-    log(`${highImpactRelevant.length} are high-impact on a currency we track`);
-    if(!highImpactRelevant.length){
-      resultsEl.innerHTML = '<div class="status">No high-impact events this week for tracked currencies.</div>';
+    const relevant = events
+      .filter(ev => currencies.has(ev.country))
+      .filter(ev => ['high','medium','low'].includes((ev.impact||'').toLowerCase()))
+      .sort((a,b)=> Date.parse(a.date) - Date.parse(b.date));
+    log(`${relevant.length} relevant event(s) (red+orange+yellow) for ${instId}`);
+
+    if(!relevant.length){
+      resultsEl.innerHTML = `<div class="status">No red/orange/yellow events this week for ${instId} (${[...currencies].join('/')}).</div>`;
     }
-    highImpactRelevant
-      .sort((a,b)=> Date.parse(a.date) - Date.parse(b.date))
-      .forEach(ev=>{
-        const evTime = Date.parse(ev.date);
-        const minsAway = evTime ? (evTime-now)/60000 : null;
-        const alertable = minsAway!=null && minsAway>=0 && minsAway<=ALERT_WINDOW_MIN;
-        const div = document.createElement('div');
-        div.className = 'event-row' + (alertable ? ' alertable' : '');
-        const when = evTime ? new Date(evTime).toLocaleString() : ev.date;
-        const minsText = minsAway==null ? '' : minsAway<0 ? `(${Math.round(-minsAway)}min ago)` : `(in ${Math.round(minsAway)}min)`;
-        div.innerHTML = `<div class="left"><b>${ev.title}</b><div class="meta">${ev.country} · ${when} ${minsText}</div></div>
-          <div class="meta">${ev.forecast ? 'Forecast: '+ev.forecast : ''} ${ev.previous ? '(prev '+ev.previous+')' : ''} ${alertable ? '<br><b style="color:var(--amber)">⚡ WOULD ALERT NOW</b>' : ''}</div>`;
-        resultsEl.appendChild(div);
-      });
-    statusEl.textContent = `Done. ${highImpactRelevant.length} relevant high-impact event(s) found this week.`;
+
+    relevant.forEach(ev=>{
+      const impact = (ev.impact||'').toLowerCase();
+      const folder = FOLDER[impact] || { label: impact.toUpperCase(), color: 'var(--muted)' };
+      const isYellow = impact === 'low';
+      const evTime = Date.parse(ev.date);
+      const minsAway = evTime ? (evTime-now)/60000 : null;
+      const alertable = !isYellow && minsAway!=null && minsAway>=0 && minsAway<=ALERT_WINDOW_MIN;
+      const div = document.createElement('div');
+      div.className = 'event-row' + (alertable ? ' alertable' : '');
+      if(isYellow) div.style.opacity = '0.55';
+      const when = evTime ? new Date(evTime).toLocaleString() : ev.date;
+      const minsText = minsAway==null ? '' : minsAway<0 ? `(${Math.round(-minsAway)}min ago)` : `(in ${Math.round(minsAway)}min)`;
+      div.innerHTML = `<div class="left">
+          <span class="badge" style="border-color:${folder.color};color:${folder.color};">${folder.label}</span>
+          <b style="margin-left:6px;">${ev.title}</b>
+          <div class="meta">${ev.country} \u00b7 ${when} ${minsText}${isYellow ? ' \u00b7 low impact, shouldn\u2019t move it much' : ''}</div>
+        </div>
+        <div class="meta">${ev.forecast ? 'Forecast: '+ev.forecast : ''} ${ev.previous ? '(prev '+ev.previous+')' : ''} ${alertable ? '<br><b style="color:var(--amber)">\u26a1 WOULD ALERT NOW</b>' : ''}</div>`;
+      resultsEl.appendChild(div);
+    });
+    const redOrange = relevant.filter(ev=> ['high','medium'].includes((ev.impact||'').toLowerCase())).length;
+    statusEl.textContent = `Done. ${redOrange} red/orange event(s), ${relevant.length-redOrange} yellow, for ${instId} this week.`;
   }catch(err){
     log(`FAILED: ${err.message}`);
-    statusEl.textContent = `Failed — see log. (${err.message})`;
-    resultsEl.innerHTML = `<div class="status" style="color:var(--red)">Could not reach the calendar feed. Check the run log — this is usually a CORS or rate-limit issue on Forex Factory's end, not the filtering logic.</div>`;
+    statusEl.textContent = `Failed \u2014 see log. (${err.message})`;
+    resultsEl.innerHTML = `<div class="status" style="color:var(--red)">Could not reach the calendar feed. Check the run log \u2014 this is usually a CORS/shields/rate-limit issue, not the filtering logic.</div>`;
   }
   btn.disabled = false;
 }
