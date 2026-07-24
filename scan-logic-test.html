@@ -314,10 +314,31 @@ function computeScan(inst, bars4, bars1, partnerBars1, partnerBars4){
 }
 
 /* ================= browser fetch (same Yahoo endpoint the terminal uses) ================= */
+// Browsers enforce CORS, Node (scan.js on GitHub Actions) doesn't — that's
+// why the exact same fetch code works server-side but can get silently
+// blocked here. If the direct request fails, retry once through a public
+// CORS proxy before giving up. This block is test-page-only; scan.js is
+// untouched since it never needs this.
+const CORS_PROXY = 'https://corsproxy.io/?url=';
+async function fetchWithCorsFallback(url){
+  try{
+    const res = await fetch(url);
+    if(!res.ok) throw new Error(`bad status ${res.status}`);
+    return res;
+  }catch(directErr){
+    try{
+      const res = await fetch(CORS_PROXY + encodeURIComponent(url));
+      if(!res.ok) throw new Error(`proxy bad status ${res.status}`);
+      return res;
+    }catch(proxyErr){
+      throw new Error(`direct: ${directErr.message} | proxy: ${proxyErr.message}`);
+    }
+  }
+}
+
 async function fetchYahooBarsFrom(host, yTicker, interval, range){
   const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yTicker)}?interval=${interval}&range=${range}`;
-  const res = await fetch(url);
-  if(!res.ok) throw new Error(`bad status ${res.status} for ${yTicker} via ${host}`);
+  const res = await fetchWithCorsFallback(url);
   const json = await res.json();
   const result = json?.chart?.result?.[0];
   if(!result) throw new Error(`no chart result for ${yTicker} via ${host}`);
@@ -425,8 +446,7 @@ async function runCalendarCheck(){
   clearLog('Fetching econ calendar...');
   statusEl.textContent = 'Fetching...';
   try{
-    const res = await fetch(CALENDAR_URL);
-    if(!res.ok) throw new Error(`bad status ${res.status}`);
+    const res = await fetchWithCorsFallback(CALENDAR_URL);
     const events = await res.json();
     log(`fetched ${events.length} events for this week`);
     const now = Date.now();
