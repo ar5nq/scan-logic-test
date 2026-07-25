@@ -375,6 +375,7 @@ function computeScan(inst, bars4, bars1, partnerBars1, partnerBars4){
 // blocked here. If the direct request fails, retry once through a public
 // CORS proxy before giving up. This block is test-page-only; scan.js is
 // untouched since it never needs this.
+const OWN_WORKER_PROXY = 'https://steep-dawn-3a5f.syedmanages.workers.dev/?url=';
 const CORS_PROXY = 'https://corsproxy.io/?url=';
 const CORS_PROXY_2 = 'https://api.allorigins.win/raw?url=';
 
@@ -385,22 +386,26 @@ async function fetchWithCorsFallback(url, attempt=0){
     return res;
   }catch(directErr){
     try{
-      const res = await fetch(CORS_PROXY + encodeURIComponent(url));
-      if(!res.ok) throw new Error(`proxy1 bad status ${res.status}`);
+      const res = await fetch(OWN_WORKER_PROXY + encodeURIComponent(url));
+      if(!res.ok) throw new Error(`worker bad status ${res.status}`);
       return res;
-    }catch(proxy1Err){
+    }catch(workerErr){
       try{
-        const res = await fetch(CORS_PROXY_2 + encodeURIComponent(url));
-        if(!res.ok) throw new Error(`proxy2 bad status ${res.status}`);
+        const res = await fetch(CORS_PROXY + encodeURIComponent(url));
+        if(!res.ok) throw new Error(`proxy1 bad status ${res.status}`);
         return res;
-      }catch(proxy2Err){
-        // Both proxies choked \u2014 likely a rate limit, not a permanent failure.
-        // Back off and retry the whole chain up to 2 more times before giving up.
-        if(attempt < 2){
-          await new Promise(r=> setTimeout(r, 1500 * (attempt+1)));
-          return fetchWithCorsFallback(url, attempt+1);
+      }catch(proxy1Err){
+        try{
+          const res = await fetch(CORS_PROXY_2 + encodeURIComponent(url));
+          if(!res.ok) throw new Error(`proxy2 bad status ${res.status}`);
+          return res;
+        }catch(proxy2Err){
+          if(attempt < 2){
+            await new Promise(r=> setTimeout(r, 1500 * (attempt+1)));
+            return fetchWithCorsFallback(url, attempt+1);
+          }
+          throw new Error(`direct: ${directErr.message} | worker: ${workerErr.message} | proxy1: ${proxy1Err.message} | proxy2: ${proxy2Err.message}`);
         }
-        throw new Error(`direct: ${directErr.message} | proxy1: ${proxy1Err.message} | proxy2: ${proxy2Err.message}`);
       }
     }
   }
@@ -627,7 +632,7 @@ function summarizeBT(instId, calls){
 const globalHistoryCache = {};
 async function getHistoryCached(id, logFn){
   if(!globalHistoryCache[id]){
-    await new Promise(r=> setTimeout(r, 1500)); // stagger requests \u2014 350ms wasn't enough, this respects the proxy's real rate limit
+    await new Promise(r=> setTimeout(r, 200)); // small courtesy stagger \u2014 your own worker won't rate-limit like the free proxies did
     globalHistoryCache[id] = await fetchYahooHistory(INSTRUMENTS[id].yTickers);
     if(logFn) logFn(`fetched ${globalHistoryCache[id].bars1.length} hourly bars for ${id} via ${globalHistoryCache[id].usedTicker}`);
   }
