@@ -104,6 +104,21 @@
       "Win" = price moved the predicted direction by that horizon \u2014 this is a directional-accuracy check, not a P&L backtest (no stop/target/spread/slippage modeled). Instruments with under ~15\u201320 STRONG calls don't have a reliable sample yet; don't market a number built on a handful of calls.
     </div>
   </section>
+  <section>
+    <h2>5 \u00b7 R-multiple backtest (real stop/target, not just direction)</h2>
+    <div class="footnote" style="border:1px solid var(--border);padding:10px 12px;background:#0d0f11;margin-bottom:10px;">
+      For every STRONG call: stop = the recent swing point that defines structure (the level that would invalidate the setup), target = 2R (twice the risk distance), max hold 48h. Whichever hits first wins; if neither hits in 48h, closes at market and counts whatever R that is. This is the test that actually answers "would this have made money," not just "was the direction right." Reuses history already fetched in Section 4 if you ran that first \u2014 saves time and proxy requests.
+    </div>
+    <button id="run-rr-btn">RUN R-MULTIPLE BACKTEST</button>
+    <div class="status" id="rr-status"></div>
+    <table id="rr-table" style="display:none;">
+      <thead><tr><th>Instrument</th><th>Trades</th><th>Win%</th><th>Avg R</th><th>Total R</th><th>Stopped/Target/Timeout</th></tr></thead>
+      <tbody id="rr-tbody"></tbody>
+    </table>
+    <div class="footnote" style="margin-top:10px;">
+      Avg R above 0 across enough trades = the strategy has a real edge even without a great directional hit rate, since wins (2R) can outweigh losses (-1R) at well under 50%. Avg R at or below 0 = no edge with this specific stop/target scheme, even if direction alone looked ~50%.
+    </div>
+  </section>
 
 </main>
 
@@ -594,6 +609,17 @@ function summarizeBT(instId, calls){
   return row;
 }
 
+/* ================= shared history cache (Sections 4 & 5 both use this) ================= */
+const globalHistoryCache = {};
+async function getHistoryCached(id, logFn){
+  if(!globalHistoryCache[id]){
+    await new Promise(r=> setTimeout(r, 350)); // stagger requests \u2014 eases proxy rate limiting
+    globalHistoryCache[id] = await fetchYahooHistory(INSTRUMENTS[id].yTickers);
+    if(logFn) logFn(`fetched ${globalHistoryCache[id].bars1.length} hourly bars for ${id} via ${globalHistoryCache[id].usedTicker}`);
+  }
+  return globalHistoryCache[id];
+}
+
 const yieldToUI = ()=> new Promise(r=> setTimeout(r, 0));
 
 async function runBacktest(){
@@ -605,15 +631,9 @@ async function runBacktest(){
   tbody.innerHTML = ''; table.style.display = 'table'; caveat.style.display = 'block';
   clearLog('Starting backtest \u2014 fetching ~2 years of hourly data per instrument, this takes a while...');
 
-  const historyCache = {};
+  const historyCache = globalHistoryCache;
   async function getHistory(id){
-    if(!historyCache[id]){
-      statusEl.textContent = `Fetching history for ${id}...`;
-      await yieldToUI();
-      historyCache[id] = await fetchYahooHistory(INSTRUMENTS[id].yTickers);
-      log(`fetched ${historyCache[id].bars1.length} hourly bars for ${id} via ${historyCache[id].usedTicker}`);
-    }
-    return historyCache[id];
+    return getHistoryCached(id, log);
   }
 
   for(const id of WATCHLIST){
@@ -644,6 +664,123 @@ async function runBacktest(){
   btn.disabled = false;
 }
 document.getElementById('run-backtest-btn').onclick = runBacktest;
+
+/* ================= R-multiple backtest (real stop/target) ================= */
+const RR_TARGET_R = 2;       // target = 2x the risk distance
+const RR_MAX_HOLD_HOURS = 48;
+
+// Re-run the same window computation as the win-rate backtest, but this time
+// also grab the pivots so we have a real stop level (the structural point
+// that would invalidate the setup), not just a direction call.
+function runWalkForwardRR(instId, ownBars1, partnerBars1){
+  const trades = [];
+  const start = BT_WINDOW_BARS;
+  const end = ownBars1.length - RR_MAX_HOLD_HOURS - 1;
+  for(let i=start; i<end; i+=BT_STEP_BARS){
+    const windowBars1 = ownBars1.slice(i-BT_WINDOW_BARS, i+1);
+    const windowBars4 = aggregateCandles(windowBars1, 4);
+    const price = windowBars1[windowBars1.length-1].c;
+    let pw1=null, pw4=null;
+    if(partnerBars1){
+      const pIdx = Math.min(i, partnerBars1.length-1);
+      pw1 = partnerBars1.slice(Math.max(0,pIdx-BT_WINDOW_BARS), pIdx+1);
+      pw4 = aggregateCandles(pw1, 4);
+    }
+    const bundle = computeScan({ id: instId, price }, windowBars4, windowBars1, pw1, pw4);
+    const result = bundle.result;
+    if(result.label !== 'STRONG') continue;
+
+    // Stop = nearest recent swing point against the trade direction \u2014 the
+    // level that, if hit, means the structural read that justified the call
+    // was wrong. This mirrors how the setup would actually be traded.
+    const pivots1 = findPivots(windowBars1, 2);
+    let stopLevel = null;
+    if(result.bias==='BULLISH' && pivots1.lows.length) stopLevel = pivots1.lows[pivots1.lows.length-1].price;
+    if(result.bias==='BEARISH' && pivots1.highs.length) stopLevel = pivots1.highs[pivots1.highs.length-1].price;
+    if(stopLevel==null) continue; // no valid structural stop, skip this call entirely
+    const risk = Math.abs(price - stopLevel);
+    if(risk <= 0) continue;
+    const targetLevel = result.bias==='BULLISH' ? price + risk*RR_TARGET_R : price - risk*RR_TARGET_R;
+
+    // Walk forward hour by hour until stop, target, or max hold is hit.
+    let outcome = null, rMultiple = 0, exitBar = null;
+    for(let h=1; h<=RR_MAX_HOLD_HOURS; h++){
+      const fb = ownBars1[i+h];
+      if(!fb) break;
+      if(result.bias==='BULLISH'){
+        if(fb.l <= stopLevel){ outcome='STOP'; rMultiple=-1; exitBar=h; break; }
+        if(fb.h >= targetLevel){ outcome='TARGET'; rMultiple=RR_TARGET_R; exitBar=h; break; }
+      }else{
+        if(fb.h >= stopLevel){ outcome='STOP'; rMultiple=-1; exitBar=h; break; }
+        if(fb.l <= targetLevel){ outcome='TARGET'; rMultiple=RR_TARGET_R; exitBar=h; break; }
+      }
+    }
+    if(!outcome){
+      const fb = ownBars1[i+RR_MAX_HOLD_HOURS];
+      if(fb){
+        const moved = result.bias==='BULLISH' ? (fb.c-price) : (price-fb.c);
+        outcome = 'TIMEOUT'; rMultiple = moved/risk; exitBar = RR_MAX_HOLD_HOURS;
+      }
+    }
+    if(outcome) trades.push({ t: ownBars1[i].t, bias: result.bias, outcome, rMultiple });
+  }
+  return trades;
+}
+
+function summarizeRR(instId, trades){
+  const n = trades.length;
+  const wins = trades.filter(t=> t.rMultiple>0).length;
+  const totalR = trades.reduce((s,t)=> s+t.rMultiple, 0);
+  const stops = trades.filter(t=>t.outcome==='STOP').length;
+  const targets = trades.filter(t=>t.outcome==='TARGET').length;
+  const timeouts = trades.filter(t=>t.outcome==='TIMEOUT').length;
+  return {
+    instId, n,
+    winPct: n ? (100*wins/n).toFixed(1)+'%' : '\u2014',
+    avgR: n ? (totalR/n).toFixed(2) : '\u2014',
+    totalR: n ? totalR.toFixed(1) : '\u2014',
+    breakdown: `${stops}/${targets}/${timeouts}`,
+  };
+}
+
+async function runRRBacktest(){
+  const btn = document.getElementById('run-rr-btn');
+  btn.disabled = true;
+  const statusEl = document.getElementById('rr-status');
+  const table = document.getElementById('rr-table'), tbody = document.getElementById('rr-tbody');
+  tbody.innerHTML = ''; table.style.display = 'table';
+  clearLog('Starting R-multiple backtest (stop = structural pivot, target = 2R, max hold 48h)...');
+
+  for(const id of WATCHLIST){
+    try{
+      statusEl.textContent = `Fetching/using cached history for ${id}...`;
+      const own = await getHistoryCached(id, log);
+      let partner = null;
+      const partnerId = SMT_PARTNER[id];
+      if(partnerId){ try{ partner = await getHistoryCached(partnerId, log); }catch(e){ log(`partner fetch failed for ${partnerId}: ${e.message} (SMT skipped for ${id})`); } }
+
+      statusEl.textContent = `Running R-multiple test on ${id}...`;
+      await yieldToUI();
+      const trades = runWalkForwardRR(id, own.bars1, partner?.bars1);
+      const row = summarizeRR(id, trades);
+
+      const tr = document.createElement('tr');
+      const rColor = row.avgR!=='\u2014' && parseFloat(row.avgR) > 0 ? 'var(--green)' : (row.avgR!=='\u2014' ? 'var(--red)' : 'var(--muted)');
+      tr.innerHTML = `<td><b>${id}</b></td><td>${row.n}</td><td>${row.winPct}</td><td style="color:${rColor}">${row.avgR}</td><td style="color:${rColor}">${row.totalR}</td><td>${row.breakdown}</td>`;
+      tbody.appendChild(tr);
+      log(`${id}: ${row.n} trades, ${row.winPct} win, avg ${row.avgR}R, total ${row.totalR}R (stop/target/timeout: ${row.breakdown})`);
+    }catch(err){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${id}</td><td colspan="5" style="color:var(--red)">FAILED: ${err.message}</td>`;
+      tbody.appendChild(tr);
+      log(`${id} FAILED: ${err.message}`);
+    }
+    await yieldToUI();
+  }
+  statusEl.textContent = 'R-multiple backtest complete.';
+  btn.disabled = false;
+}
+document.getElementById('run-rr-btn').onclick = runRRBacktest;
 </script>
 </body>
 </html>
